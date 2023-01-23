@@ -209,7 +209,20 @@ config = dict(
         io='2. text_embedding, latent -> latent',
         random='on/off'),
     latent_reader =d( InputBlock, io_dim='cfg.latent_dim', # io_dim = latent_dim
-        io='3. text_reader.latent, prev_latent, context.latent -> latent'), # random stop gradient prev_latent
+        io='3. text_reader.latent, context.latent -> latent'), # random stop gradient prev_latent
+        # context.latent : prev_latent, compressed latent of the text, similar topic -> the goal is train to use compressed nkownledge
+        #  >> prev_latent : previous layer latent
+        #  >> compressed latent of the text :
+        #      -> is a chuncked pass of the text to the model
+        #      -> this might be cause of data leakage wich is ok if the compression ratio is high enough
+        #      -> preferably run with backprop
+        #      -> we can have re-compressed latent, to learn to synthetise latent
+        #  >> similar topic : can be prebuild with classic method
+        #  -> we can add random unrelated latent, to train the indexer
+        #  -> ounce the indexer improve we can use to choose latent during training
+        #  preformance trick : batch with group of similar data
+        #      -> same text at different completion position
+        #      -> text from similar topic
     processor =d(     [ProcessBlock]*4, io_dim=cfg.latent_dim,
         io='4. latent_reader -> latent'), # random stop gradient latent
     text_writer =d(   [OutputBlock]*2,

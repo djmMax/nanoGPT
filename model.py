@@ -156,7 +156,6 @@ class SelfAttention(nn.Module):
         y = self.resid_dropout(self.c_proj(y))
         return y
 
-
 class MLP(nn.Module):
 
     def __init__(self, config):
@@ -206,11 +205,11 @@ config = dict(
     indexer = dict(
         model=        [OutputBlock], # or IndexerBlock
         io='1. latent -> index_schema'),
-    text_reader = d(  [InputBlock,ProcessBlock],
+    text_reader = d(  [InputBlock,ProcessBlock], positional_emb='alibi',
         io='2. text_embedding, latent -> latent',
         random='on/off'),
     latent_reader =d( InputBlock, io_dim='cfg.latent_dim', # io_dim = latent_dim
-        io='3. text_reader.latent, prev_latent -> latent'), # random stop gradient prev_latent
+        io='3. text_reader.latent, prev_latent, context.latent -> latent'), # random stop gradient prev_latent
     processor =d(     [ProcessBlock]*4, io_dim=cfg.latent_dim,
         io='4. latent_reader -> latent'), # random stop gradient latent
     text_writer =d(   [OutputBlock]*2,
@@ -218,15 +217,22 @@ config = dict(
     
     ### intermediate evaluation
     eval_ouput = d(
-        model=CausalEvaluation, # with confident probe
+        model=CausalEvaluation, # with confidence probe
         io='eval. ground_throught,output_text_emb -> loss'),
     eval_indexer = d(
         model = IndexerEvaluation,
         io='eval. text_reader.attn_map, latent_reader.attn_map, index_schema -> loss'),
 
+    ### train to use old nkowledge
+    save_for_later = 'add_data(prev_latent, batch.idx)',
+    ###### we can make we provide close to context data (learn to reuse latent), or even close to context aggregated concept (learn to synthitise)
+
     ### training
     loss = 'eval_ouput.loss + eval_indexer.loss * 0.1',
     prev_latent = 'prev_latent.append(latent)',
+
+    ### loggin need to consider randomizaton during training, to how performance evolduring training
+    ###### or performing in many way conisidering ablation/parameter search
 
     ### after 1-4 repeat
     text_token = 'text_token.append(data.get(token=32))', # shoul be nice to have variable number of added token

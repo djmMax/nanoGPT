@@ -22,7 +22,106 @@ def new_gelu(x):
     """
     return 0.5 * x * (1.0 + torch.tanh(math.sqrt(2.0 / math.pi) * (x + 0.044715 * torch.pow(x, 3.0))))
 
-class CausalSelfAttention(nn.Module):
+class IOProcessingAttention(nn.Module):
+    # TODO check if split this class in Output and Input, effect on performance and code readability
+    # TODO input/output dim can be different than latent dim (here is config.n_embd)
+    def __init__(self, config, type='input', io_dim=None, mult_head_dim=None):
+        super().__init__()
+        self.is_encoding = type == 'input'
+        self.is_decoding = type == 'ouput'
+        self.is_process  = type == 'process' # same as basic self attention
+        self.io_dim = io_dim if io_dim else config.n_embd
+        self.mult_head_dim = mult_head_dim if mult_head_dim else config.n_embd
+        
+        assert self.mult_head_dim % config.n_head == 0
+
+        if self.is_process:
+            self.attn_l = nn.Linear(config.n_embd, 3 * self.mult_head_dim)
+        else:
+            # key, query, value projections for all ouput heads, but in a batch
+            self.attn_c = nn.Linear(io_dim, 2 * self.mult_head_dim)
+            # key, value projections for latent heads
+            self.attn_l = nn.Linear(config.n_embd, 2 * self.mult_head_dim)
+            self.attn_query = nn.Linear(config.n_embd if self.is_encoding else self.io_dim, self.mult_head_dim) # HACK so that with attn_ use we get k and v -> 2 * config.n_embd
+
+        # output projection
+        self.c_proj = nn.Linear(mult_head_dim, io_dim)
+        # regularization
+        self.attn_dropout = nn.Dropout(config.dropout)
+        self.resid_dropout = nn.Dropout(config.dropout)
+
+        if self.is_decoding:
+            # self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+            #                             .view(1, 1, config.block_size, config.block_size))
+            # this will assume blocksize == max_number_latent
+            # causal mask to ensure that attention is only applied to the left in the ouput sequence
+            # TODO check if torch.tril(..., diagonal=...) is correctly used
+            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size*2), diagonal=config.block_size-1)
+                                        .view(1, 1, config.block_size, config.block_size*2))
+
+        self.block_size = config.block_size
+        self.latent_size = config.block_size # TODO make latent size ajustable
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
+
+    def forward(self, l, x=None):
+        # if x is None:
+        #     B, L, C = l.size()
+        #     T = L
+        # else:
+        B, T, C = x.size() # batch size, sequence length, embedding dimensionality (mult_head_dim original code was n_embd)
+        _, L, _ = l.size() # latent input
+
+        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # TODO compute only q_l xor q_c since we are just using one of them at ounce
+        if self.is_process:
+            q, k ,v = self.attn_l(l).split(self.mult_head_dim, dim=2)
+        else:
+            k_l ,v_l = self.attn_l(l).split(self.mult_head_dim, dim=2)
+            k_c ,v_c  = self.attn_c(x).split(self.mult_head_dim, dim=2)
+        
+            # TODO check if conditiontal statement affect performance (eg. compile), if yes split this class
+            # TODO check if pytorch compile does similar work to FlashAttention, recurisve TODO read FlashAttention + understand GPU/Auto-diff-graph
+            # TODO check if we can freeze conditiontal statement in case they affect performance (eg. functionnal programming with fixed argument)
+            # in decoding the output is the sequence
+            if self.is_decoding:
+                k = torch.cat((k_l, k_c)) # TODO check if torch compiler will combine k_l, k_c effeceintly without using more memmory 
+                q = self.attn_query(x) # query from the context for the output # q = q_c
+                v = torch.cat((v_l, v_c))
+            
+            # in enconding the output is the latent 
+            if self.is_encoding:
+                k = torch.cat((k_c, k_l)) # is not k_l, k_c because permute them make the ouput the latent
+                q = self.attn_query(l) # query from the latent for the output # q = q_l
+                v = torch.cat((v_c, v_l))
+
+        k = k.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, L+T, hs) or (B, nh, T+L, hs) or (B, nh, L, hs)
+        q = q.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh,   T, hs) or (B, nh,   L, hs) or (B, nh, L, hs)
+        v = v.view(B, -1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, L+T, hs) or (B, nh, T+L, hs) or (B, nh, L, hs)
+
+        # self-attention + partial causal attention on x; Self-attend: (B, nh, T, hs) x (B, nh, hs, L+T) -> (B, nh, T, L+T) for decoding
+        # self-attention + partial causal attention on l; Self-attend: (B, nh, L, hs) x (B, nh, hs, T+L) -> (B, nh, T, T+L) for encoding
+        att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+        if self.is_decoding: 
+            # att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            begin = self.block_size - L # TODO check if this is a bottleneck
+            end   = begin + L + T
+            att   = att.masked_fill(self.bias[:, :, begin:end, begin:end] == 0, float('-inf')) # (B, nh, T, L+T) # TODO double check this mask 
+            # IMPROVEMENT we may have variable number of latent # self.bias[:,:,T-L:L+T,T-L:L+T]
+        att = F.softmax(att, dim=-1)
+        att = self.attn_dropout(att)
+        y = att @ v #    (B, nh, T, L+T) x (B, nh, L+T, hs) -> (B, nh, T, hs) # for decoding
+                    # or (B, nh, L, T+L) x (B, nh, T+L, hs) -> (B, nh, L, hs) # for encoding
+        
+        y = y.transpose(1, 2).contiguous() # re-assemble all head outputs side by side
+        y = y.view(B, L, C) if self.is_encoding else y.view(B, T, C)
+
+        # output projection
+        y = self.resid_dropout(self.c_proj(y))
+        return y
+
+
+class SelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
@@ -34,9 +133,6 @@ class CausalSelfAttention(nn.Module):
         # regularization
         self.attn_dropout = nn.Dropout(config.dropout)
         self.resid_dropout = nn.Dropout(config.dropout)
-        # causal mask to ensure that attention is only applied to the left in the input sequence
-        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                    .view(1, 1, config.block_size, config.block_size))
         self.n_head = config.n_head
         self.n_embd = config.n_embd
 
@@ -49,9 +145,8 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         att = self.attn_dropout(att)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -60,6 +155,7 @@ class CausalSelfAttention(nn.Module):
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
 
 class MLP(nn.Module):
 
@@ -75,6 +171,137 @@ class MLP(nn.Module):
         x = self.c_proj(x)
         x = self.dropout(x)
         return x
+
+class InputBlock(nn.Module):
+    pass
+class OutputBlock(nn.Module):
+    pass
+class ProcessBlock(nn.Module):
+    pass
+class BlockComposes(nn.Module):
+    def forward(self,x):
+        # NOTE compose block base on config
+        # NOTE we may dynamic forward pass
+        pass
+
+class CausalEvaluation:
+    pass
+class IndexerEvaluation:
+    pass
+class Noise:
+    pass
+
+cfg = dict()
+# d = lambda **kwarg: dict(**kwarg)
+def d(model, **kwarg):
+    kwarg['model'] = model
+    return dict(**kwarg) # rename dict function
+
+config = dict(
+    ## input
+    text_embedding = dict(vocab_size=256, io_dim=32),
+    init_latent = dict(model=Noise, number_of_latent=128, dim=512), # or  dict(vocab_size=25, dim=512),
+
+    ## repeat this
+    indexer = dict(
+        model=        [OutputBlock], # or IndexerBlock
+        io='1. latent -> index_schema'),
+    text_reader = d(  [InputBlock,ProcessBlock],
+        io='2. text_embedding, latent -> latent',
+        random='on/off'),
+    latent_reader =d( InputBlock, io_dim='cfg.latent_dim', # io_dim = latent_dim
+        io='3. text_reader.latent, prev_latent -> latent'), # random stop gradient prev_latent
+    processor =d(     [ProcessBlock]*4, io_dim=cfg.latent_dim,
+        io='4. latent_reader -> latent'), # random stop gradient latent
+    text_writer =d(   [OutputBlock]*2,
+        io='5. processor.latent -> output_text_emb'),
+    
+    ### intermediate evaluation
+    eval_ouput = d(
+        model=CausalEvaluation, # with confident probe
+        io='eval. ground_throught,output_text_emb -> loss'),
+    eval_indexer = d(
+        model = IndexerEvaluation,
+        io='eval. text_reader.attn_map, latent_reader.attn_map, index_schema -> loss'),
+
+    ### training
+    loss = 'eval_ouput.loss + eval_indexer.loss * 0.1',
+    prev_latent = 'prev_latent.append(latent)',
+
+    ### after 1-4 repeat
+    text_token = 'text_token.append(data.get(token=32))', # shoul be nice to have variable number of added token
+    # witch means redo : text_token -> text_embedding
+
+    #general config
+    cfg=dict(
+        _input_lenght=300,
+        _output_lenght=50,
+        _io_dim=32,
+        _prev_latent_history=5,
+        _latent_size=20,
+        _latent_dim=512,
+        _tokenizer='char_tokenizer'
+    )
+)
+
+
+'''
+# another synthax
+
+## input
+text_token -> text_embedding
+
+## repeat this
+indexer = OutputBlock
+    latent -> index_schema
+text_reader = InputBlock, ProcessBlock # random on/off
+    text_embedding, latent -> latent
+latent_reader = InputBlock, io_dim=cfg.latent_dim  # random on/off
+    text_reader.latent, prev_latent -> latent
+processor = ProcessBlock*4
+    latent_reader -> latent
+text_writer = OutputBlock*2            # maybe random on/off
+    processor.latent -> output_text_emb
+
+### intermediate evaluation
+eval_ouput = CausalEvaluation # with confident probe
+    ground_throught, output_text_emb -> loss
+eval_indexer = IndexerEvaluation
+    text_reader.attn_map, latent_reader.attn_map, index_schema -> loss
+loss = eval_ouput.loss + eval_indexer.loss * 0.1
+
+prev_latent.append(latent)
+
+### after 1-4 repeat
+text_token.append(data.get(token=32)) # shoul be nice to have variable number of added token
+text_token -> text_embedding
+
+
+## default param
+_latent_dim  = 256
+_latent_size = 32
+_max_token_output = 32
+_input_token = 256
+
+_tokenizer   = char_tokenizer # will set _text_embed = 128
+
+
+NOTE: we can read ounce, by combining text_reader + latent_reader, by making the InputBlock work on input with diffreent dimension
+k1, v1 = slef.attn_text(text_embed)         # (T, Emb_dim)    -> (T, head_dim)
+k2, v2 = slef.attn_prev_latent(prev_latent) # (P, Latent_dim) -> (P, head_dim)
+... 
+q, k_l, v_l = slef.attn_latent(latent) # (L, Latent_dim) -> (L, head_dim)
+
+k = torch.cat(k1, k2, ..., k_l) # (T + P + L, head_dim)
+v = torch.cat(v1, v2, ..., v_l) # (T + P + L, head_dim)
+
+attn_map = attn(q, k.T) # (L, head_dim) x (head_dim,T + P + L) -> (L, T + P + L)
+y = attn_map @ v        # (L, T + P + L) x (T + P + L, head_dim) -> (L, head_dim)
+
+# IMPROVEMENT, head_dim of v can be independent than k, that we v.head_dim=Latent_dim for the output and k can be smaller. but we may have issue with multihead!
+# k1, v1, k2, v2,... can be implemented via sub class with their forward() that we will use to read those input
+'''
+
 
 class Block(nn.Module):
 
